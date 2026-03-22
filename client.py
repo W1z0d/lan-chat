@@ -5,6 +5,7 @@ import json
 import http.cookiejar
 import threading
 import time
+import socket
 
 class ChatClient:
     def __init__(self, server_url):
@@ -23,7 +24,6 @@ class ChatClient:
             return False
 
     def get_messages_json(self):
-        """Получает список сообщений через JSON API."""
         try:
             response = self.opener.open(self.server_url + '/api/messages')
             data = response.read().decode('utf-8')
@@ -62,8 +62,28 @@ def show_new_messages(messages, old_messages):
     else:
         print("Новых сообщений нет.")
 
+def discover_servers(timeout=5):
+    """Слушает broadcast на порту 44444 и возвращает список URL найденных серверов."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('', 44444))
+    sock.settimeout(timeout)
+    servers = set()
+    print(f"Поиск серверов в сети (ожидание {timeout} сек)...")
+    try:
+        while True:
+            data, addr = sock.recvfrom(1024)
+            msg = data.decode('utf-8')
+            if msg.startswith('CHAT_SERVER:'):
+                url = msg.split(':', 1)[1]
+                servers.add(url)
+    except socket.timeout:
+        pass
+    finally:
+        sock.close()
+    return sorted(servers)
+
 def auto_refresh_worker(client, stop_event, callback):
-    """Фоновый поток для автообновления."""
     while not stop_event.is_set():
         time.sleep(3)
         if stop_event.is_set():
@@ -76,9 +96,24 @@ def main():
     if len(sys.argv) > 1:
         server_url = sys.argv[1]
     else:
-        server_url = input("Введите адрес сервера (например, http://192.168.31.43:8080): ").strip()
-        if not server_url:
-            server_url = "http://localhost:8080"
+        server_url = None
+
+    if server_url is None:
+        # Пытаемся обнаружить сервер автоматически
+        found = discover_servers()
+        if found:
+            print("Найденные серверы:")
+            for i, url in enumerate(found, 1):
+                print(f"{i}. {url}")
+            choice = input("Введите номер сервера или адрес вручную: ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(found):
+                server_url = found[int(choice)-1]
+            else:
+                server_url = choice
+        else:
+            server_url = input("Введите адрес сервера (например, http://192.168.31.43:8080): ").strip()
+            if not server_url:
+                server_url = "http://localhost:8080"
 
     nick = input("Введите ваш ник: ").strip()
     if not nick:
@@ -94,27 +129,26 @@ def main():
 
     print(f"Консольный клиент чата (ник: {nick})")
     print("Доступные команды:")
-    print("  all   - показать все сообщения")
-    print("  new   - показать новые сообщения")
-    print("  send  - отправить сообщение")
-    print("  auto  - включить/выключить автообновление (каждые 3 сек)")
-    print("  exit  - выход")
+    print("  all      - показать все сообщения")
+    print("  new      - показать новые сообщения")
+    print("  send     - отправить сообщение")
+    print("  auto     - включить/выключить автообновление")
+    print("  discover - поиск других серверов в сети")
+    print("  connect <url> - подключиться к другому серверу")
+    print("  exit     - выход")
     print("-" * 50)
 
-    # Получаем начальные сообщения
     all_msgs = client.get_messages_json()
     if all_msgs is None:
         return
     show_all_messages(all_msgs)
     last_msgs = all_msgs.copy()
 
-    # Параметры автообновления
     auto_refresh_enabled = False
     stop_auto_event = threading.Event()
     auto_thread = None
 
     def on_auto_refresh(messages):
-        """Вызывается при автообновлении."""
         nonlocal last_msgs
         if messages and messages != last_msgs:
             new_msgs = [msg for msg in messages if msg not in last_msgs]
@@ -123,11 +157,6 @@ def main():
                 for i, msg in enumerate(new_msgs, 1):
                     print(f"  {i}. {msg}")
                 last_msgs = messages.copy()
-            else:
-                # Сообщений нет, но список изменился? (например, перезагрузка)
-                # Обновляем last_msgs, чтобы не показывать старые
-                if len(messages) != len(last_msgs):
-                    last_msgs = messages.copy()
 
     def set_auto_refresh(enabled):
         nonlocal auto_refresh_enabled, auto_thread, stop_auto_event
@@ -170,7 +199,6 @@ def main():
                     continue
                 if client.send_message(msg):
                     print("Сообщение отправлено.")
-                    # После отправки обновляем список
                     all_msgs = client.get_messages_json()
                     if all_msgs is not None:
                         show_new_messages(all_msgs, last_msgs)
@@ -178,12 +206,33 @@ def main():
                 else:
                     print("Не удалось отправить.")
             elif cmd == "auto":
-                if auto_refresh_enabled:
-                    set_auto_refresh(False)
+                set_auto_refresh(not auto_refresh_enabled)
+            elif cmd == "discover":
+                servers = discover_servers()
+                if servers:
+                    print("Найденные серверы:")
+                    for i, url in enumerate(servers, 1):
+                        print(f"{i}. {url}")
                 else:
-                    set_auto_refresh(True)
+                    print("Серверы не найдены.")
+            elif cmd.startswith("connect "):
+                new_url = cmd[8:].strip()
+                if new_url:
+                    # Переподключаемся
+                    set_auto_refresh(False)
+                    client = ChatClient(new_url)
+                    if client.send_nick(nick):
+                        print(f"Подключено к {new_url}")
+                        all_msgs = client.get_messages_json()
+                        if all_msgs is not None:
+                            show_all_messages(all_msgs)
+                            last_msgs = all_msgs.copy()
+                        if auto_refresh_enabled:
+                            set_auto_refresh(True)
+                    else:
+                        print("Не удалось подключиться к новому серверу.")
             else:
-                print("Неизвестная команда. Доступны: all, new, send, auto, exit")
+                print("Неизвестная команда. Доступны: all, new, send, auto, discover, connect <url>, exit")
     except KeyboardInterrupt:
         print("\nЗавершено пользователем.")
         set_auto_refresh(False)

@@ -4,6 +4,8 @@ import urllib.parse
 import json
 from html import escape
 import socket
+import threading
+import time
 
 START_PORT = 8080
 messages = []
@@ -31,6 +33,16 @@ def find_free_port(start_port):
 class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
 
+def broadcast_announcer(ip, port, stop_event, interval=10):
+    """Фоновый поток: рассылка адреса сервера по broadcast."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    message = f"CHAT_SERVER:http://{ip}:{port}".encode('utf-8')
+    while not stop_event.is_set():
+        sock.sendto(message, ('255.255.255.255', 44444))
+        time.sleep(interval)
+    sock.close()
+
 class ChatHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         print(f"{self.address_string()} - {format % args}")
@@ -57,7 +69,6 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                     self.end_headers()
                     self.safe_write(self.chat_page(nick).encode('utf-8'))
             elif self.path == '/api/messages':
-                # JSON API для получения сообщений
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json; charset=utf-8')
                 self.end_headers()
@@ -151,8 +162,6 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 <ul id="messageList"></ul>
 
 <script>
-    let lastCount = 0;
-
     async function loadMessages() {{
         try {{
             const response = await fetch('/api/messages');
@@ -164,26 +173,19 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                 li.textContent = msg;
                 list.appendChild(li);
             }}
-            lastCount = messages.length;
         }} catch(e) {{
             console.error('Ошибка загрузки сообщений:', e);
         }}
     }}
-
-    // Первоначальная загрузка
     loadMessages();
-
-    // Автообновление каждые 3 секунды
     setInterval(loadMessages, 3000);
 
-    // Отправка сообщения через AJAX без перезагрузки страницы
     const form = document.getElementById('messageForm');
     form.addEventListener('submit', async (e) => {{
         e.preventDefault();
         const input = document.getElementById('messageInput');
         const message = input.value.trim();
         if (!message) return;
-
         try {{
             const formData = new URLSearchParams();
             formData.append('message', message);
@@ -193,8 +195,8 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                 body: formData
             }});
             if (response.ok) {{
-                input.value = ''; // очищаем поле
-                loadMessages();   // сразу обновляем список
+                input.value = '';
+                loadMessages();
             }}
         }} catch(e) {{
             console.error('Ошибка отправки:', e);
@@ -207,8 +209,18 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 if __name__ == "__main__":
     local_ip = get_local_ip()
     PORT = find_free_port(START_PORT)
+    stop_broadcast = threading.Event()
+    # Запускаем поток-анонсер
+    announcer = threading.Thread(target=broadcast_announcer, args=(local_ip, PORT, stop_broadcast), daemon=True)
+    announcer.start()
+    print(f"Сервер запущен на порту {PORT}")
+    print(f"Доступен в локальной сети по адресу: http://{local_ip}:{PORT}")
+    print("Broadcast-анонс активен (порт 44444)")
+    print("Для остановки нажмите Ctrl+C")
     with ThreadedTCPServer(("0.0.0.0", PORT), ChatHandler) as httpd:
-        print(f"Сервер запущен на порту {PORT}")
-        print(f"Доступен в локальной сети по адресу: http://{local_ip}:{PORT}")
-        print("Для остановки нажмите Ctrl+C")
-        httpd.serve_forever()
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nОстановка сервера...")
+            stop_broadcast.set()
+            httpd.shutdown()
